@@ -1,0 +1,8 @@
+string instruction
+float32 timeout_s
+uint32 max_steps
+---
+bool success
+string message
+uint32 steps_executed
+float32 elapsed_s

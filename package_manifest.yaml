@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MulanPSL-2.0
+#
+# VLA Client — LLM-callable skill for VLA inference + execution.
+#
+# Lifecycle: Lazy-activate (first MCP call triggers atlas resolution)
+#   on_init      — parse config, validate parameters
+#   on_activate  — resolve vla_server endpoint via atlas, start ROS subscriber thread
+#   on_deactivate — stop subscriber thread, clear endpoint cache
+#
+# Architecture: actions are sent DIRECTLY to /arm/pos_cmd (piper_ctl_rbnx),
+# bypassing MoveIt entirely. Internal safety filter (joint limits + rate limit)
+# replaces MoveIt's collision detection for the 10Hz VLA control loop.
+#
+manifestVersion: 1
+
+package:
+  name: com.robonix.piper_grasp.vla_client
+  version: 0.1.0
+  vendor: robonix
+  description: VLA client skill — LLM-callable entry point for vision-language-action inference and execution.
+  license: MulanPSL-2.0
+
+capability_id: vla_client
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+
+capabilities:
+  - name: robonix/skill/vla/driver
+  - name: robonix/skill/vla/execute
+
+config_defaults:
+  vla_server_url: "http://localhost:8777"
+  use_atlas_discovery: true
+  full_image_topic: /camera/color/image_raw
+  wrist_image_topic: /wrist_camera/color/image_raw
+  joint_states_topic: /arm/joint_states_single
+  pos_cmd_topic: /arm/pos_cmd
+  image_resize: [256, 256]
+  action_hz: 10.0
+  timeout_s: 60.0
+  joint_state_dim: 7
+  # Safety filter
+  joint_limits_low: [-2.618, -2.618, -2.618, -2.618, -2.618, -2.618]
+  joint_limits_high: [2.618, 2.618, 2.618, 2.618, 2.618, 2.618]
+  max_delta_per_step: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+  gripper_range: [0.0, 1.0]
+  enable_safety_filter: true

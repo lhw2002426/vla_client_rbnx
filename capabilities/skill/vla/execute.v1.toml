@@ -1,0 +1,11 @@
+[contract]
+id      = "robonix/skill/vla/execute"
+version = "1"
+kind    = "skill"
+idl     = "vla_client/srv/VlaExecute.srv"
+
+[mode]
+type = "rpc"
+
+[semantics]
+user_invocable = true
