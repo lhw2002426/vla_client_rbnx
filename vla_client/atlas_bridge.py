@@ -59,7 +59,7 @@ _latest_joint_states: Optional[np.ndarray] = None
 _obs_lock = threading.Lock()
 
 # Safety filter state
-_last_action: Optional[np.ndarray] = None
+_last_action: Optional[np.ndarray] = None  # last commanded [x,y,z,r,p,y, gripper_raw]
 
 # ROS thread handle
 _ros_thread: Optional[threading.Thread] = None
@@ -274,54 +274,97 @@ def _call_vla_server(instruction: str, full_image: np.ndarray,
 
 
 def _send_action_to_arm(action: np.ndarray) -> None:
-    """Send action to arm with safety filter. Directly publishes to /arm/pos_cmd."""
-    global _last_action
+    """Send VLA delta action to arm with safety filter.
 
-    joints = action[:6].copy()
-    gripper = float(action[6]) if len(action) > 6 else 0.5
+    VLA model outputs are DELTA actions (not absolute poses):
+        action[0:6] = [dx, dy, dz, d_roll, d_pitch, d_yaw]  (Cartesian delta)
+        action[6]   = gripper value (unnormalized, ~[-1, 1] range)
 
+    This function:
+        1. Reads current end-effector pose from /arm/end_pose (or latest joint_states)
+        2. Adds delta to get target pose
+        3. Applies safety filter (workspace limits + rate limit)
+        4. Maps gripper from model range to physical range
+        5. Publishes target pose to /arm/pos_cmd
+    """
+    global _last_action, _current_pose
+
+    delta_pose = action[:6].copy()   # [dx, dy, dz, d_roll, d_pitch, d_yaw]
+    gripper_raw = float(action[6]) if len(action) > 6 else 0.0
+
+    # ── Get current pose as baseline for delta accumulation ──────────────
+    # Use the last commanded pose (for smooth accumulation), or fall back to
+    # the observed joint_states on the very first step.
+    if _last_action is not None:
+        current = _last_action[:6].copy()
+    else:
+        # First step: read current end-effector pose from observation
+        with _obs_lock:
+            if _latest_joint_states is not None:
+                current = _latest_joint_states[:6].copy()
+            else:
+                log.warning("no current pose available, using zeros")
+                current = np.zeros(6, dtype=np.float32)
+
+    # ── Apply delta ─────────────────────────────────────────────────────
+    target = current + delta_pose
+
+    # ── Safety filter ───────────────────────────────────────────────────
     if _cfg.get("enable_safety_filter", True):
-        # 1. Joint limits hard clip
+        # 1. Workspace / joint limits hard clip
         lo = np.array(_cfg.get("joint_limits_low", [-2.618]*6), dtype=np.float32)
         hi = np.array(_cfg.get("joint_limits_high", [2.618]*6), dtype=np.float32)
-        joints = np.clip(joints, lo, hi)
+        target = np.clip(target, lo, hi)
 
-        # 2. Rate limiting (prevent single-step jumps)
+        # 2. Rate limiting: cap the effective delta per step
         max_delta = np.array(_cfg.get("max_delta_per_step", [0.1]*6), dtype=np.float32)
-        if _last_action is not None:
-            delta = joints - _last_action[:6]
-            delta_clipped = np.clip(delta, -max_delta, max_delta)
-            joints = _last_action[:6] + delta_clipped
+        effective_delta = target - current
+        effective_delta = np.clip(effective_delta, -max_delta, max_delta)
+        target = current + effective_delta
 
-        # 3. Gripper clip
-        g_range = _cfg.get("gripper_range", [0.0, 1.0])
-        gripper = float(np.clip(gripper, g_range[0], g_range[1]))
+    # ── Gripper mapping ─────────────────────────────────────────────────
+    # VLA model outputs gripper in unnormalized range (approx [-1, +1]):
+    #   -1 → fully closed,  +1 → fully open  (convention may vary)
+    # Map to piper physical gripper width (meters): [0.0, 0.08]
+    gripper_model_min = float(_cfg.get("gripper_model_min", -1.0))
+    gripper_model_max = float(_cfg.get("gripper_model_max", 1.0))
+    gripper_phys_min = float(_cfg.get("gripper_phys_min", 0.0))    # fully closed (m)
+    gripper_phys_max = float(_cfg.get("gripper_phys_max", 0.08))   # fully open (m)
 
-    # Update last action
-    _last_action = np.concatenate([joints, [gripper]])
+    # Linear map: model range → physical range
+    t = (gripper_raw - gripper_model_min) / (gripper_model_max - gripper_model_min + 1e-8)
+    t = float(np.clip(t, 0.0, 1.0))
+    gripper_physical = gripper_phys_min + t * (gripper_phys_max - gripper_phys_min)
 
-    # Publish to ROS
-    _publish_pos_cmd(joints, gripper)
+    # ── Update state ────────────────────────────────────────────────────
+    _last_action = np.concatenate([target, [gripper_raw]])
+
+    # ── Publish ─────────────────────────────────────────────────────────
+    _publish_pos_cmd(target, gripper_physical)
 
 
-def _publish_pos_cmd(joints: np.ndarray, gripper: float) -> None:
-    """Publish PosCmd to /arm/pos_cmd via the ROS subscriber thread's publisher."""
+def _publish_pos_cmd(target_pose: np.ndarray, gripper: float) -> None:
+    """Publish target end-effector pose to /arm/pos_cmd.
+
+    PosCmd fields (from piper_msgs):
+        x, y, z         — target end-effector position (meters, in base frame)
+        roll, pitch, yaw — target end-effector orientation (radians)
+        gripper          — gripper width (meters, 0=closed, 0.08=open)
+        mode1, mode2     — control modes (0=default)
+    """
     if _g_pos_cmd_pub is None:
         log.warning("pos_cmd publisher not ready")
         return
     try:
         from piper_msgs.msg import PosCmd
         msg = PosCmd()
-        # Map action array to PosCmd fields
-        # Convention: joints[0:6] = [x, y, z, roll, pitch, yaw] in Cartesian
-        # or joint angles depending on action space
-        msg.x = float(joints[0])
-        msg.y = float(joints[1])
-        msg.z = float(joints[2])
-        msg.roll = float(joints[3])
-        msg.pitch = float(joints[4])
-        msg.yaw = float(joints[5])
-        msg.gripper = gripper
+        msg.x = float(target_pose[0])
+        msg.y = float(target_pose[1])
+        msg.z = float(target_pose[2])
+        msg.roll = float(target_pose[3])
+        msg.pitch = float(target_pose[4])
+        msg.yaw = float(target_pose[5])
+        msg.gripper = float(gripper)
         msg.mode1 = 0
         msg.mode2 = 0
         _g_pos_cmd_pub.publish(msg)

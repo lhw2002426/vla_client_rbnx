@@ -40,9 +40,13 @@ config_defaults:
   action_hz: 10.0
   timeout_s: 60.0
   joint_state_dim: 7
-  # Safety filter
-  joint_limits_low: [-2.618, -2.618, -2.618, -2.618, -2.618, -2.618]
-  joint_limits_high: [2.618, 2.618, 2.618, 2.618, 2.618, 2.618]
-  max_delta_per_step: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-  gripper_range: [0.0, 1.0]
+  # Safety filter (workspace limits for end-effector Cartesian pose)
+  joint_limits_low: [-0.5, -0.5, 0.0, -3.14, -3.14, -3.14]    # [x,y,z,r,p,y] lower bounds
+  joint_limits_high: [0.5, 0.5, 0.5, 3.14, 3.14, 3.14]         # [x,y,z,r,p,y] upper bounds
+  max_delta_per_step: [0.05, 0.05, 0.05, 0.15, 0.15, 0.15]     # max change per step
   enable_safety_filter: true
+  # Gripper mapping (model output range → physical meters)
+  gripper_model_min: -1.0        # model output for fully closed
+  gripper_model_max: 1.0         # model output for fully open
+  gripper_phys_min: 0.0          # physical gripper fully closed (m)
+  gripper_phys_max: 0.08         # physical gripper fully open (m)
