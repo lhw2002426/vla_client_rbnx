@@ -178,24 +178,26 @@ def _ros_spin_loop():
 
     def _decode_ros_image(msg: Image) -> np.ndarray:
         """Decode sensor_msgs/Image to numpy RGB array WITHOUT cv_bridge.
-        Handles rgb8, bgr8, and raw encodings."""
+        Handles rgb8, bgr8, and raw encodings.
+        IMPORTANT: copies data out of msg.data to avoid dangling pointer."""
         h, w = msg.height, msg.width
         encoding = msg.encoding.lower()
-        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        # Copy msg.data to owned numpy array (msg buffer may be recycled by DDS)
+        raw = np.array(msg.data, dtype=np.uint8)
         if encoding in ("rgb8",):
-            img = raw.reshape((h, w, 3))
+            img = raw.reshape((h, w, 3)).copy()
         elif encoding in ("bgr8",):
-            img = raw.reshape((h, w, 3))[:, :, ::-1]  # BGR → RGB
+            img = raw.reshape((h, w, 3))[:, :, ::-1].copy()
         elif encoding in ("rgba8",):
-            img = raw.reshape((h, w, 4))[:, :, :3]
+            img = raw.reshape((h, w, 4))[:, :, :3].copy()
         elif encoding in ("bgra8",):
-            img = raw.reshape((h, w, 4))[:, :, 2::-1]
+            img = raw.reshape((h, w, 4))[:, :, 2::-1].copy()
         elif encoding in ("mono8",):
             grey = raw.reshape((h, w))
             img = np.stack([grey, grey, grey], axis=-1)
         else:
             # fallback: assume 3-channel
-            img = raw.reshape((h, w, 3))
+            img = raw.reshape((h, w, 3)).copy()
         return img
 
     def _on_full_image(msg: Image):
@@ -261,10 +263,19 @@ def _ros_spin_loop():
     log.info("[ROS-THREAD] entering spin loop...")
 
     while not _ros_stop_event.is_set():
-        rclpy.spin_once(node, timeout_sec=0.1)
+        try:
+            rclpy.spin_once(node, timeout_sec=0.1)
+        except Exception as e:
+            log.warning("rclpy.spin_once raised: %s", e)
 
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        node.destroy_node()
+    except Exception:
+        pass
+    try:
+        rclpy.shutdown()
+    except Exception:
+        pass
     log.info("ROS subscriber thread stopped")
 
 
