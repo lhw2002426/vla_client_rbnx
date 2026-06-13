@@ -152,15 +152,22 @@ def _ros_spin_loop():
     Publishes:
         sensor_msgs/JointState on /arm/joint_states  — joint command for piper_ctl
     """
+    log.info("[ROS-THREAD] importing rclpy...")
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+    log.info("[ROS-THREAD] importing sensor_msgs...")
     from sensor_msgs.msg import Image, JointState
+    log.info("[ROS-THREAD] importing cv_bridge...")
     from cv_bridge import CvBridge
 
+    log.info("[ROS-THREAD] calling rclpy.init()...")
     rclpy.init()
+    log.info("[ROS-THREAD] creating node...")
     node = rclpy.create_node("vla_client_subscriber")
+    log.info("[ROS-THREAD] creating CvBridge...")
     bridge = CvBridge()
+    log.info("[ROS-THREAD] init done, setting up subscriptions...")
 
     qos_best_effort = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -234,6 +241,7 @@ def _ros_spin_loop():
 
     log.info("subscribed: full=%s wrist=%s joints=%s | publish: %s",
              full_topic, wrist_topic, js_topic, joint_cmd_topic)
+    log.info("[ROS-THREAD] entering spin loop...")
 
     while not _ros_stop_event.is_set():
         rclpy.spin_once(node, timeout_sec=0.1)
