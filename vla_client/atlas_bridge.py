@@ -158,15 +158,10 @@ def _ros_spin_loop():
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
     log.info("[ROS-THREAD] importing sensor_msgs...")
     from sensor_msgs.msg import Image, JointState
-    log.info("[ROS-THREAD] importing cv_bridge...")
-    from cv_bridge import CvBridge
-
     log.info("[ROS-THREAD] calling rclpy.init()...")
     rclpy.init()
     log.info("[ROS-THREAD] creating node...")
     node = rclpy.create_node("vla_client_subscriber")
-    log.info("[ROS-THREAD] creating CvBridge...")
-    bridge = CvBridge()
     log.info("[ROS-THREAD] init done, setting up subscriptions...")
 
     qos_best_effort = QoSProfile(
@@ -181,29 +176,51 @@ def _ros_spin_loop():
     joint_cmd_topic = _cfg.get("joint_cmd_topic", "/arm/joint_states")
     resize = _cfg.get("image_resize", [256, 256])
 
+    def _decode_ros_image(msg: Image) -> np.ndarray:
+        """Decode sensor_msgs/Image to numpy RGB array WITHOUT cv_bridge.
+        Handles rgb8, bgr8, and raw encodings."""
+        h, w = msg.height, msg.width
+        encoding = msg.encoding.lower()
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        if encoding in ("rgb8",):
+            img = raw.reshape((h, w, 3))
+        elif encoding in ("bgr8",):
+            img = raw.reshape((h, w, 3))[:, :, ::-1]  # BGR → RGB
+        elif encoding in ("rgba8",):
+            img = raw.reshape((h, w, 4))[:, :, :3]
+        elif encoding in ("bgra8",):
+            img = raw.reshape((h, w, 4))[:, :, 2::-1]
+        elif encoding in ("mono8",):
+            grey = raw.reshape((h, w))
+            img = np.stack([grey, grey, grey], axis=-1)
+        else:
+            # fallback: assume 3-channel
+            img = raw.reshape((h, w, 3))
+        return img
+
     def _on_full_image(msg: Image):
         global _latest_full_image
         try:
-            img = bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+            img = _decode_ros_image(msg)
             from PIL import Image as PILImage
             pil = PILImage.fromarray(img)
             pil = pil.resize((resize[0], resize[1]), PILImage.BILINEAR)
             with _obs_lock:
                 _latest_full_image = np.array(pil, dtype=np.uint8)
         except Exception as e:
-            log.debug("full_image callback error: %s", e)
+            log.warning("full_image callback error: %s", e)
 
     def _on_wrist_image(msg: Image):
         global _latest_wrist_image
         try:
-            img = bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+            img = _decode_ros_image(msg)
             from PIL import Image as PILImage
             pil = PILImage.fromarray(img)
             pil = pil.resize((resize[0], resize[1]), PILImage.BILINEAR)
             with _obs_lock:
                 _latest_wrist_image = np.array(pil, dtype=np.uint8)
         except Exception as e:
-            log.debug("wrist_image callback error: %s", e)
+            log.warning("wrist_image callback error: %s", e)
 
     def _on_joint_states(msg: JointState):
         """Latch current joint angles as proprioceptive input for VLA.
