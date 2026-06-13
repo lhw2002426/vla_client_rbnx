@@ -97,9 +97,9 @@ _ros_stop_event = threading.Event()
 
 
 # ── atlas-resolved upstream contracts ───────────────────────────────────────
-REQUIRED_INPUTS = {
-    "vla_act": ("robonix/service/vla/inference/act", "mcp"),
-}
+# VLA server is connected directly via HTTP (config.vla_server_url),
+# so NO required atlas inputs. Only optional ones for post-grasp reset etc.
+REQUIRED_INPUTS = {}
 
 OPTIONAL_INPUTS = {
     "reset": ("robonix/service/manipulation/reset", "mcp"),
@@ -107,37 +107,9 @@ OPTIONAL_INPUTS = {
 
 
 def _resolve_inputs(deadline_s: float = 60.0) -> dict[str, str]:
-    """Block until atlas can resolve REQUIRED_INPUTS, best-effort OPTIONAL."""
+    """Best-effort resolve OPTIONAL_INPUTS on atlas. VLA server is
+    accessed directly via HTTP URL from config, not through atlas."""
     resolved: dict[str, str] = {}
-    deadline = time.time() + deadline_s
-    while time.time() < deadline:
-        for key, (cid, transport) in REQUIRED_INPUTS.items():
-            if key in resolved:
-                continue
-            try:
-                cap_view = ATLAS.find_unique_capability(
-                    contract_id=cid, transport=transport)
-                ch = vla_skill.connect_capability(cap_view, cid, transport)
-            except Exception:
-                continue
-            ep = ch.endpoint
-            try:
-                ch.close()
-            except Exception:
-                pass
-            if ep:
-                resolved[key] = ep
-                log.info("resolved %s [%s] → %s", cid, transport, ep)
-        if len(resolved) == len(REQUIRED_INPUTS):
-            break
-        time.sleep(2.0)
-
-    missing = [k for k in REQUIRED_INPUTS if k not in resolved]
-    if missing:
-        raise RuntimeError(
-            f"vla_client cannot find deps on atlas: "
-            f"{[REQUIRED_INPUTS[k][0] for k in missing]}. "
-            f"Ensure vla_server_rbnx is ACTIVE.")
 
     for key, (cid, transport) in OPTIONAL_INPUTS.items():
         try:
