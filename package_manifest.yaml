@@ -28,7 +28,7 @@ package:
   description: VLA client skill — LLM-callable entry point for vision-language-action inference and JOINT-SPACE execution.
   license: MulanPSL-2.0
 
-capability_id: vla_client
+capability_id: openvla_client
 
 build: bash scripts/build.sh
 start: bash scripts/start.sh

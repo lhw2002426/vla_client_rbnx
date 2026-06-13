@@ -65,7 +65,7 @@ logging.basicConfig(
 log = logging.getLogger("vla_client")
 
 vla_skill = Skill(
-    id=os.environ.get("ROBONIX_CAPABILITY_ID", "vla_client"),
+    id=os.environ.get("ROBONIX_CAPABILITY_ID", "openvla_client"),
     namespace="robonix/skill/vla",
 )
 
