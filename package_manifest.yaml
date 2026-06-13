@@ -1,23 +1,31 @@
 # SPDX-License-Identifier: MulanPSL-2.0
 #
-# VLA Client — LLM-callable skill for VLA inference + execution.
+# VLA Client — LLM-callable skill for VLA inference + JOINT-SPACE execution.
 #
 # Lifecycle: Lazy-activate (first MCP call triggers atlas resolution)
 #   on_init      — parse config, validate parameters
 #   on_activate  — resolve vla_server endpoint via atlas, start ROS subscriber thread
 #   on_deactivate — stop subscriber thread, clear endpoint cache
 #
-# Architecture: actions are sent DIRECTLY to /arm/pos_cmd (piper_ctl_rbnx),
-# bypassing MoveIt entirely. Internal safety filter (joint limits + rate limit)
-# replaces MoveIt's collision detection for the 10Hz VLA control loop.
+# Architecture: VLA outputs are de-normalized into ABSOLUTE JOINT TARGETS and
+# sent DIRECTLY to /arm/joint_states (sensor_msgs/JointState — piper_ctl_rbnx
+# subscribes there for joint-space control). MoveIt is bypassed entirely;
+# the internal safety filter (hardware joint-limit clip + per-step rate limit)
+# replaces MoveIt's collision detection for the closed-loop VLA control rate.
+#
+# Action / state unit convention (must match dataset builder):
+#   - Joints 1..6:  dataset SDK units = 0.001°  (rad = SDK / 57324.840764)
+#   - Gripper (j7): dataset SDK units = "2 * µm"
+#                   (meters = SDK / 2_000_000;  piper_ctl multiplies meters
+#                    by 1e6 then by gripper_val_mutiple=2 before CAN.)
 #
 manifestVersion: 1
 
 package:
   name: com.robonix.piper_grasp.vla_client
-  version: 0.1.0
+  version: 0.2.0
   vendor: robonix
-  description: VLA client skill — LLM-callable entry point for vision-language-action inference and execution.
+  description: VLA client skill — LLM-callable entry point for vision-language-action inference and JOINT-SPACE execution.
   license: MulanPSL-2.0
 
 capability_id: vla_client
@@ -32,21 +40,45 @@ capabilities:
 config_defaults:
   vla_server_url: "http://localhost:8777"
   use_atlas_discovery: true
+
+  # Topics
   full_image_topic: /camera/color/image_raw
   wrist_image_topic: /wrist_camera/color/image_raw
-  joint_states_topic: /arm/joint_states_single
-  pos_cmd_topic: /arm/pos_cmd
+  joint_states_topic: /arm/joint_states_single   # piper_ctl publishes proprio here
+  joint_cmd_topic:    /arm/joint_states          # piper_ctl subscribes here for joint ctl
+
   image_resize: [256, 256]
   action_hz: 10.0
   timeout_s: 60.0
   joint_state_dim: 7
-  # Safety filter (workspace limits for end-effector Cartesian pose)
-  joint_limits_low: [-0.5, -0.5, 0.0, -3.14, -3.14, -3.14]    # [x,y,z,r,p,y] lower bounds
-  joint_limits_high: [0.5, 0.5, 0.5, 3.14, 3.14, 3.14]         # [x,y,z,r,p,y] upper bounds
-  max_delta_per_step: [0.05, 0.05, 0.05, 0.15, 0.15, 0.15]     # max change per step
+
+  # ── Action de-normalization ────────────────────────────────────────────
+  # Must EXACTLY match piper_grasp_2cam_dataset_builder.ACTION_MIN / MAX.
+  # Order: [joint1, joint2, joint3, joint4, joint5, joint6, gripper], all
+  # in dataset SDK units (0.001° for joints, "2*µm" for gripper).
+  action_min: [66563.0,  -2921.0, -151557.0,  -53279.0, -37605.0,  -94743.0, -3000.0]
+  action_max: [132905.0, 194064.0,    712.0,  103398.0,  71141.0,  119408.0, 88500.0]
+
+  # ── Hardware joint limits (safety clip — applied AFTER de-normalization) ──
+  # piper datasheet limits (mechanical hard stops) in SDK units (0.001°).
+  # Joint 1..6 typical piper limits ≈ ±154°, ±50°(j2 lower limited), etc.
+  # We use a conservative superset of dataset bounds so dataset values pass
+  # through unclipped, while extreme out-of-distribution outputs get caught.
+  # Gripper hard limits: [0, 80 mm] = [0, 80000] in 2*µm-style ⇒ [0, 160000];
+  #     but the dataset uses raw 2*µm where 88500 ≈ 44.25 mm, so limit at
+  #     [0, 160000] = 0–80mm leaves headroom while clamping negatives to 0.
+  hw_action_min: [-160000.0, -160000.0, -160000.0, -160000.0, -160000.0, -160000.0,      0.0]
+  hw_action_max: [ 160000.0,  160000.0,  160000.0,  160000.0,  160000.0,  160000.0, 160000.0]
+
+  # ── Per-step rate limit (in dataset SDK units) ────────────────────────
+  # 5000 SDK units = 5° per step  → at 10 Hz = 50°/s, comfortable for piper.
+  # Gripper: 20000 = 10 mm per step (full close→open in ~4 steps @ 10Hz).
+  max_delta_per_step_sdk: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 20000.0]
+
   enable_safety_filter: true
-  # Gripper mapping (model output range → physical meters)
-  gripper_model_min: -1.0        # model output for fully closed
-  gripper_model_max: 1.0         # model output for fully open
-  gripper_phys_min: 0.0          # physical gripper fully closed (m)
-  gripper_phys_max: 0.08         # physical gripper fully open (m)
+
+  # ── JointState publish parameters ─────────────────────────────────────
+  # piper_ctl reads velocity[6] as global velocity % (1-100); 0 → default 30.
+  joint_velocity_pct: 30.0
+  # piper_ctl reads effort[6] as gripper effort; clipped to [0.5, 3].
+  gripper_effort: 1.0

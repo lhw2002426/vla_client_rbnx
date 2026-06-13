@@ -38,7 +38,8 @@ bash scripts/build.sh
 | `use_atlas_discovery` | `true` | Discover vla_server via atlas |
 | `full_image_topic` | `/camera/color/image_raw` | Global camera |
 | `wrist_image_topic` | `/wrist_camera/color/image_raw` | Wrist camera |
-| `joint_states_topic` | `/arm/joint_states_single` | Joint feedback |
+| `joint_states_topic` | `/arm/joint_states_single` | Joint feedback (proprio for VLA) |
+| `end_pose_topic` | `/arm/end_pose` | End-effector pose feedback (Cartesian baseline) |
 | `pos_cmd_topic` | `/arm/pos_cmd` | Action output (direct to piper_ctl) |
 | `image_resize` | `[256, 256]` | Resize before sending to VLA |
 | `action_hz` | `10.0` | Control frequency |

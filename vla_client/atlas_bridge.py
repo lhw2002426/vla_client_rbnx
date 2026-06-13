@@ -1,19 +1,42 @@
 # SPDX-License-Identifier: MulanPSL-2.0
-"""vla_client_rbnx atlas bridge — VLA inference + execution skill.
+"""vla_client_rbnx atlas bridge — VLA inference + JOINT-SPACE execution skill.
 
 LLM-callable skill that:
 1. Subscribes to camera images + joint states (ROS topics)
 2. Calls vla_server_rbnx for action inference (HTTP via atlas-resolved endpoint)
-3. Sends actions DIRECTLY to /arm/pos_cmd (piper_ctl_rbnx), bypassing MoveIt
-4. Includes an internal safety filter (joint limit clip + rate limiting)
+3. **De-normalizes [-1, 1] actions back to absolute joint targets**
+4. Sends joint commands DIRECTLY to /arm/joint_states (piper_ctl_rbnx joint cb)
+5. Includes an internal safety filter (hardware joint-limit clip + rate limit)
 
 Architecture:
-    VLA Server ─actions─► vla_client safety filter ─► /arm/pos_cmd ─► piper_ctl ─► CAN ─► arm
+    VLA Server ─[-1,1] actions─► vla_client de-norm + safety ─►
+        sensor_msgs/JointState on /arm/joint_states ─► piper_ctl ─► CAN ─► arm
 
-Why not MoveIt:
-    VLA outputs are already "planned" trajectories. MoveIt would re-plan and
-    destroy learned trajectory features. Also, MoveIt's plan+execute takes 3-5s
-    per step, incompatible with 10Hz closed-loop control.
+Action space (matches piper_grasp_2cam dataset builder):
+    action[0:6] — joint1..joint6 absolute angles
+    action[6]   — gripper width
+    All seven dims live in normalized [-1, 1] space and are de-normalized
+    using ACTION_MIN / ACTION_MAX (the dataset's per-channel min/max).
+
+Unit conventions (CRITICAL):
+    Dataset / VLA training space — uses piper SDK raw units:
+        joints  : 0.001° (so divide by 1000 → degrees, then * π/180 → rad)
+                  Equivalent factor used by piper_ctl: 1° = 1000 SDK units,
+                  rad = SDK / 57324.840764  (= 1000 * 180/π).
+        gripper : "0.001 mm" units * 2 (the SDK uses µm, then piper_ctl
+                  multiplies by `gripper_val_mutiple=2` again before
+                  publishing to CAN). On the JointState write side we go:
+                  meters → SDK_mm * 2; on the read side piper_ctl sees
+                  position[6] in METERS and multiplies by 1e6 then by 2.
+                  So: SDK_units = meters * 2_000_000  ⇔  meters = SDK / 2e6.
+                  Dataset gripper range [-3000, 88500] (SDK units) maps to
+                  meters [-0.0015, 0.04425].
+
+Why JOINT space and not Cartesian:
+    The training dataset records absolute joint angles + gripper, NOT
+    Cartesian end-effector poses. Sending those values to /arm/pos_cmd
+    (which expects [x,y,z,roll,pitch,yaw,gripper] in meters/rad) would be
+    a category error and drive the arm into limits / singularities.
 
 Lifecycle (Skill — lazy activate):
     on_init      — parse config, validate safety params
@@ -27,7 +50,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
 import requests
@@ -47,6 +70,13 @@ vla_skill = Skill(
 )
 
 
+# ── unit-conversion constants ───────────────────────────────────────────────
+# Matches piper_ctrl_single_node.joint_callback:
+#   factor = 57324.840764   # 1000 * 180/π  (rad → SDK 0.001°)
+#   joint7 (gripper): SDK_units = position_in_m * 1e6 * gripper_val_mutiple(=2)
+SDK_PER_RAD = 57324.840764
+SDK_PER_M_GRIPPER = 2.0e6   # piper_ctl multiplies meters by 1e6 then by 2
+
 # ── shared state ────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
 _cfg: dict = {}
@@ -55,11 +85,11 @@ _endpoints: Optional[dict[str, str]] = None
 # ROS subscriber state (written by subscriber thread, read by handler)
 _latest_full_image: Optional[np.ndarray] = None
 _latest_wrist_image: Optional[np.ndarray] = None
-_latest_joint_states: Optional[np.ndarray] = None
+_latest_joint_states: Optional[np.ndarray] = None       # joint angles (proprio for VLA)
 _obs_lock = threading.Lock()
 
-# Safety filter state
-_last_action: Optional[np.ndarray] = None  # last commanded [x,y,z,r,p,y, gripper_raw]
+# Safety filter state — last commanded joint vector in DATASET (SDK) units
+_last_action_sdk: Optional[np.ndarray] = None
 
 # ROS thread handle
 _ros_thread: Optional[threading.Thread] = None
@@ -141,7 +171,15 @@ def _start_ros_subscriber_thread():
 
 
 def _ros_spin_loop():
-    """ROS2 subscriber loop — runs in dedicated thread."""
+    """ROS2 subscriber loop — runs in dedicated thread.
+
+    Subscribes:
+        full_image, wrist_image  — camera RGB streams (resized to model input)
+        joint_states_single      — current joint angles (proprio for VLA)
+
+    Publishes:
+        sensor_msgs/JointState on /arm/joint_states  — joint command for piper_ctl
+    """
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -161,6 +199,7 @@ def _ros_spin_loop():
     full_topic = _cfg.get("full_image_topic", "/camera/color/image_raw")
     wrist_topic = _cfg.get("wrist_image_topic", "/wrist_camera/color/image_raw")
     js_topic = _cfg.get("joint_states_topic", "/arm/joint_states_single")
+    joint_cmd_topic = _cfg.get("joint_cmd_topic", "/arm/joint_states")
     resize = _cfg.get("image_resize", [256, 256])
 
     def _on_full_image(msg: Image):
@@ -188,29 +227,41 @@ def _ros_spin_loop():
             log.debug("wrist_image callback error: %s", e)
 
     def _on_joint_states(msg: JointState):
+        """Latch current joint angles as proprioceptive input for VLA.
+
+        IMPORTANT: piper_ctl publishes joints in **radians** (and gripper in
+        **meters**). The VLA model was trained on **dataset SDK units**
+        (0.001° for joints, "2*µm" for gripper). We convert here so the
+        proprio handed to the server matches training distribution exactly.
+        """
         global _latest_joint_states
         dim = int(_cfg.get("joint_state_dim", 7))
         positions = list(msg.position)
-        if len(positions) >= dim:
-            with _obs_lock:
-                _latest_joint_states = np.array(positions[:dim], dtype=np.float32)
+        if len(positions) < dim:
+            return
+        # Convert ROS units → dataset SDK units (matches builder's raw range)
+        sdk = np.zeros(dim, dtype=np.float32)
+        n_joints = min(6, dim)
+        for i in range(n_joints):
+            sdk[i] = float(positions[i]) * SDK_PER_RAD          # rad → 0.001°
+        if dim >= 7 and len(positions) >= 7:
+            sdk[6] = float(positions[6]) * SDK_PER_M_GRIPPER    # m   → SDK gripper
+        with _obs_lock:
+            _latest_joint_states = sdk
 
     node.create_subscription(Image, full_topic, _on_full_image, qos_best_effort)
     node.create_subscription(Image, wrist_topic, _on_wrist_image, qos_best_effort)
     node.create_subscription(JointState, js_topic, _on_joint_states, 10)
 
-    # Also create publisher for pos_cmd
-    from piper_msgs.msg import PosCmd
-    pos_cmd_topic = _cfg.get("pos_cmd_topic", "/arm/pos_cmd")
-    _pos_cmd_pub = node.create_publisher(PosCmd, pos_cmd_topic, 10)
+    # Publisher: joint-space command to piper_ctl
+    _joint_cmd_pub = node.create_publisher(JointState, joint_cmd_topic, 10)
 
-    # Store publisher reference globally
-    global _g_pos_cmd_pub, _g_node
-    _g_pos_cmd_pub = _pos_cmd_pub
+    global _g_joint_cmd_pub, _g_node
+    _g_joint_cmd_pub = _joint_cmd_pub
     _g_node = node
 
     log.info("subscribed: full=%s wrist=%s joints=%s | publish: %s",
-             full_topic, wrist_topic, js_topic, pos_cmd_topic)
+             full_topic, wrist_topic, js_topic, joint_cmd_topic)
 
     while not _ros_stop_event.is_set():
         rclpy.spin_once(node, timeout_sec=0.1)
@@ -220,7 +271,7 @@ def _ros_spin_loop():
     log.info("ROS subscriber thread stopped")
 
 
-_g_pos_cmd_pub = None
+_g_joint_cmd_pub = None
 _g_node = None
 
 
@@ -273,103 +324,113 @@ def _call_vla_server(instruction: str, full_image: np.ndarray,
         return None
 
 
-def _send_action_to_arm(action: np.ndarray) -> None:
-    """Send VLA delta action to arm with safety filter.
+# ── action de-normalization + safety ────────────────────────────────────────
 
-    VLA model outputs are DELTA actions (not absolute poses):
-        action[0:6] = [dx, dy, dz, d_roll, d_pitch, d_yaw]  (Cartesian delta)
-        action[6]   = gripper value (unnormalized, ~[-1, 1] range)
+def _denormalize_action(action_norm: np.ndarray) -> np.ndarray:
+    """Map normalized [-1, 1] action → dataset SDK-unit absolute joint vector.
 
-    This function:
-        1. Reads current end-effector pose from /arm/end_pose (or latest joint_states)
-        2. Adds delta to get target pose
-        3. Applies safety filter (workspace limits + rate limit)
-        4. Maps gripper from model range to physical range
-        5. Publishes target pose to /arm/pos_cmd
+    Inverse of dataset builder's:
+        norm = 2 * (raw - ACTION_MIN) / (ACTION_MAX - ACTION_MIN) - 1
+    so:
+        raw  = 0.5 * (norm + 1) * (ACTION_MAX - ACTION_MIN) + ACTION_MIN
+
+    Returns 7-vector in **dataset SDK units**:
+        [j1, j2, j3, j4, j5, j6]  in 0.001°
+        [j7]                       in "2 * µm" (piper SDK gripper)
     """
-    global _last_action, _current_pose
-
-    delta_pose = action[:6].copy()   # [dx, dy, dz, d_roll, d_pitch, d_yaw]
-    gripper_raw = float(action[6]) if len(action) > 6 else 0.0
-
-    # ── Get current pose as baseline for delta accumulation ──────────────
-    # Use the last commanded pose (for smooth accumulation), or fall back to
-    # the observed joint_states on the very first step.
-    if _last_action is not None:
-        current = _last_action[:6].copy()
-    else:
-        # First step: read current end-effector pose from observation
-        with _obs_lock:
-            if _latest_joint_states is not None:
-                current = _latest_joint_states[:6].copy()
-            else:
-                log.warning("no current pose available, using zeros")
-                current = np.zeros(6, dtype=np.float32)
-
-    # ── Apply delta ─────────────────────────────────────────────────────
-    target = current + delta_pose
-
-    # ── Safety filter ───────────────────────────────────────────────────
-    if _cfg.get("enable_safety_filter", True):
-        # 1. Workspace / joint limits hard clip
-        lo = np.array(_cfg.get("joint_limits_low", [-2.618]*6), dtype=np.float32)
-        hi = np.array(_cfg.get("joint_limits_high", [2.618]*6), dtype=np.float32)
-        target = np.clip(target, lo, hi)
-
-        # 2. Rate limiting: cap the effective delta per step
-        max_delta = np.array(_cfg.get("max_delta_per_step", [0.1]*6), dtype=np.float32)
-        effective_delta = target - current
-        effective_delta = np.clip(effective_delta, -max_delta, max_delta)
-        target = current + effective_delta
-
-    # ── Gripper mapping ─────────────────────────────────────────────────
-    # VLA model outputs gripper in unnormalized range (approx [-1, +1]):
-    #   -1 → fully closed,  +1 → fully open  (convention may vary)
-    # Map to piper physical gripper width (meters): [0.0, 0.08]
-    gripper_model_min = float(_cfg.get("gripper_model_min", -1.0))
-    gripper_model_max = float(_cfg.get("gripper_model_max", 1.0))
-    gripper_phys_min = float(_cfg.get("gripper_phys_min", 0.0))    # fully closed (m)
-    gripper_phys_max = float(_cfg.get("gripper_phys_max", 0.08))   # fully open (m)
-
-    # Linear map: model range → physical range
-    t = (gripper_raw - gripper_model_min) / (gripper_model_max - gripper_model_min + 1e-8)
-    t = float(np.clip(t, 0.0, 1.0))
-    gripper_physical = gripper_phys_min + t * (gripper_phys_max - gripper_phys_min)
-
-    # ── Update state ────────────────────────────────────────────────────
-    _last_action = np.concatenate([target, [gripper_raw]])
-
-    # ── Publish ─────────────────────────────────────────────────────────
-    _publish_pos_cmd(target, gripper_physical)
+    a_min = np.array(_cfg["action_min"], dtype=np.float64)
+    a_max = np.array(_cfg["action_max"], dtype=np.float64)
+    a = np.asarray(action_norm, dtype=np.float64).flatten()
+    if a.shape[0] != a_min.shape[0]:
+        # Truncate / pad defensively
+        n = min(a.shape[0], a_min.shape[0])
+        out = np.zeros(a_min.shape[0], dtype=np.float64)
+        out[:n] = a[:n]
+        a = out
+    raw = 0.5 * (a + 1.0) * (a_max - a_min) + a_min
+    return raw.astype(np.float32)
 
 
-def _publish_pos_cmd(target_pose: np.ndarray, gripper: float) -> None:
-    """Publish target end-effector pose to /arm/pos_cmd.
+def _apply_safety(target_sdk: np.ndarray) -> np.ndarray:
+    """Clip joint command to hardware limits and bound the per-step delta.
 
-    PosCmd fields (from piper_msgs):
-        x, y, z         — target end-effector position (meters, in base frame)
-        roll, pitch, yaw — target end-effector orientation (radians)
-        gripper          — gripper width (meters, 0=closed, 0.08=open)
-        mode1, mode2     — control modes (0=default)
+    Operates entirely in SDK units (0.001° for joints, SDK gripper for j7).
     """
-    if _g_pos_cmd_pub is None:
-        log.warning("pos_cmd publisher not ready")
+    global _last_action_sdk
+    target = target_sdk.astype(np.float32).copy()
+
+    if not _cfg.get("enable_safety_filter", True):
+        return target
+
+    # 1) Hardware joint-limit clip
+    hw_min = np.array(_cfg["hw_action_min"], dtype=np.float32)
+    hw_max = np.array(_cfg["hw_action_max"], dtype=np.float32)
+    target = np.clip(target, hw_min, hw_max)
+
+    # 2) Rate limiting (max change per step, in SDK units)
+    if _last_action_sdk is not None:
+        max_delta = np.array(_cfg["max_delta_per_step_sdk"], dtype=np.float32)
+        delta = target - _last_action_sdk
+        delta = np.clip(delta, -max_delta, max_delta)
+        target = _last_action_sdk + delta
+
+    return target
+
+
+def _send_action_to_arm(action_norm: np.ndarray) -> None:
+    """De-normalize a [-1,1] VLA action and publish to /arm/joint_states."""
+    global _last_action_sdk
+
+    # 1) De-normalize → SDK units
+    target_sdk = _denormalize_action(action_norm)
+
+    # 2) Safety filter (clip + rate limit)
+    target_sdk = _apply_safety(target_sdk)
+
+    # 3) Convert SDK units → ROS units expected by piper_ctl.joint_callback
+    #    joints[0..5] : 0.001°  → rad
+    #    joint[6]     : "2*µm" → meters    (piper_ctl will * 1e6 * 2 again)
+    target_ros = np.zeros(7, dtype=np.float64)
+    target_ros[:6] = target_sdk[:6] / SDK_PER_RAD
+    target_ros[6]  = float(target_sdk[6]) / SDK_PER_M_GRIPPER
+
+    # 4) Publish JointState
+    _publish_joint_state(target_ros)
+
+    # 5) Latch state for next-step rate limiting
+    _last_action_sdk = target_sdk
+
+
+def _publish_joint_state(positions_ros: np.ndarray) -> None:
+    """Publish sensor_msgs/JointState to /arm/joint_states.
+
+    Field layout matches what piper_ctrl_single_node.joint_callback expects:
+        name     = ['joint1'..'joint6', 'gripper']
+        position = [j1..j6 (rad), gripper (m)]
+        velocity = [0]*6 + [vel_pct]   # SDK velocity %, 1-100; 0 = use default 30
+        effort   = [0]*6 + [grip_eff]  # gripper effort 0.5-3
+    """
+    if _g_joint_cmd_pub is None:
+        log.warning("joint_states publisher not ready")
         return
     try:
-        from piper_msgs.msg import PosCmd
-        msg = PosCmd()
-        msg.x = float(target_pose[0])
-        msg.y = float(target_pose[1])
-        msg.z = float(target_pose[2])
-        msg.roll = float(target_pose[3])
-        msg.pitch = float(target_pose[4])
-        msg.yaw = float(target_pose[5])
-        msg.gripper = float(gripper)
-        msg.mode1 = 0
-        msg.mode2 = 0
-        _g_pos_cmd_pub.publish(msg)
+        from sensor_msgs.msg import JointState
+        msg = JointState()
+        if _g_node is not None:
+            msg.header.stamp = _g_node.get_clock().now().to_msg()
+        msg.name = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6', 'gripper']
+        msg.position = [float(x) for x in positions_ros]
+
+        vel_pct = float(_cfg.get("joint_velocity_pct", 30.0))
+        # piper_ctl reads velocity[6] as "all-axis %"; non-zero triggers MotionCtrl_2
+        msg.velocity = [0.0] * 6 + [vel_pct]
+
+        grip_eff = float(_cfg.get("gripper_effort", 1.0))
+        msg.effort = [0.0] * 6 + [grip_eff]
+
+        _g_joint_cmd_pub.publish(msg)
     except Exception as e:
-        log.error("publish pos_cmd failed: %s", e)
+        log.error("publish joint_states failed: %s", e)
 
 
 def _safe_reset(context: str) -> None:
@@ -410,7 +471,7 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
     (observe → infer → act → repeat) until timeout or max_steps.
     Typical latency: 10-60s depending on task complexity.
     """
-    global _last_action
+    global _last_action_sdk
 
     if _endpoints is None:
         return VlaExecute_Response(
@@ -434,7 +495,7 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
     t0 = time.monotonic()
     deadline = t0 + timeout_s
     steps_executed = 0
-    _last_action = None  # Reset safety filter state at start of new execution
+    _last_action_sdk = None  # Reset safety filter state at start of new execution
 
     log.info("execute(%r) timeout=%.1fs max_steps=%d hz=%.1f",
              instruction, timeout_s, max_steps, action_hz)
@@ -447,15 +508,15 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
             # 1. Get current observation
             full_img, wrist_img, state = _get_current_observation()
             if full_img is None or state is None:
-                # Wrist image fallback: use full_image if wrist camera unavailable
-                if full_img is not None and wrist_img is None:
-                    wrist_img = full_img.copy()
-                    log.debug("wrist_image unavailable, using full_image as fallback")
-                else:
-                    time.sleep(0.1)
-                    continue
+                # Required obs not yet available — wait and retry.
+                time.sleep(0.1)
+                continue
+            if wrist_img is None:
+                # Optional: fall back to full_image if wrist camera not running.
+                wrist_img = full_img.copy()
+                log.debug("wrist_image unavailable — using full_image as fallback")
 
-            # 2. Call VLA server
+            # 2. Call VLA server (state is in SDK units, matching training)
             actions = _call_vla_server(instruction, full_img, wrist_img, state)
             if actions is None:
                 return VlaExecute_Response(
@@ -507,6 +568,14 @@ def init(cfg):
         except json.JSONDecodeError as e:
             return Err(f"bad config_json: {e}")
     _cfg = cfg
+
+    # Sanity-check that de-normalization constants are present and well-shaped.
+    for key in ("action_min", "action_max", "hw_action_min",
+                "hw_action_max", "max_delta_per_step_sdk"):
+        v = _cfg.get(key)
+        if v is None or len(v) != 7:
+            return Err(f"config.{key} must be a length-7 list (got {v!r})")
+
     log.info("CMD_INIT ok (vla_server_url=%s, action_hz=%.1f, safety=%s)",
              _cfg.get("vla_server_url", "http://localhost:8777"),
              float(_cfg.get("action_hz", 10.0)),
@@ -534,10 +603,10 @@ def activate():
 @vla_skill.on_deactivate
 def deactivate():
     """CMD_DEACTIVATE: stop ROS thread, clear state."""
-    global _endpoints, _last_action
+    global _endpoints, _last_action_sdk
     with _state_lock:
         _endpoints = None
-        _last_action = None
+        _last_action_sdk = None
     _ros_stop_event.set()
     if _ros_thread is not None:
         _ros_thread.join(timeout=5.0)
