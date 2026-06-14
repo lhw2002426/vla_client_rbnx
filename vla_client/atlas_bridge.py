@@ -558,10 +558,11 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
             # END TODO: DEBUG ONLY
 
             # 2. Normalize state from SDK raw to [-1, 1] before sending to VLA server
-            a_min = np.array(_cfg["action_min"], dtype=np.float64)
-            a_max = np.array(_cfg["action_max"], dtype=np.float64)
+            # Use state_min/state_max if provided, otherwise fall back to action_min/max
+            s_min = np.array(_cfg.get("state_min", _cfg["action_min"]), dtype=np.float64)
+            s_max = np.array(_cfg.get("state_max", _cfg["action_max"]), dtype=np.float64)
             state_normalized = np.clip(
-                2.0 * (state - a_min) / (a_max - a_min + 1e-8) - 1.0,
+                2.0 * (state - s_min) / (s_max - s_min + 1e-8) - 1.0,
                 -1.0, 1.0
             ).astype(np.float32)
             log.info("STATE raw SDK: %s", np.array2string(state, precision=0, suppress_small=True))
