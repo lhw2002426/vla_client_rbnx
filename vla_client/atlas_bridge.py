@@ -176,6 +176,13 @@ def _ros_spin_loop():
     joint_cmd_topic = _cfg.get("joint_cmd_topic", "/arm/joint_states")
     resize = _cfg.get("image_resize", [256, 256])
 
+    # Crop regions matching training data capture (take_photo.py)
+    # Format: [y_start, y_end, x_start, x_end] for 640x480 raw frames
+    # Exterior (full): crop center-ish region → 256x256
+    full_crop = _cfg.get("full_image_crop", [162, 418, 192, 448])
+    # Wrist: crop center-ish region → 256x256
+    wrist_crop = _cfg.get("wrist_image_crop", [122, 378, 192, 448])
+
     def _decode_ros_image(msg: Image) -> np.ndarray:
         """Decode sensor_msgs/Image to numpy RGB array WITHOUT cv_bridge.
         Handles rgb8, bgr8, and raw encodings.
@@ -200,15 +207,25 @@ def _ros_spin_loop():
             img = raw.reshape((h, w, 3)).copy()
         return img
 
+    def _crop_and_resize(img: np.ndarray, crop: list, target_size: list) -> np.ndarray:
+        """Crop image with [y_start, y_end, x_start, x_end] then resize.
+        If crop region is out of bounds or image is already small, skip crop."""
+        from PIL import Image as PILImage
+        h, w = img.shape[:2]
+        y0, y1, x0, x1 = crop
+        if y1 <= h and x1 <= w and y0 >= 0 and x0 >= 0:
+            img = img[y0:y1, x0:x1]
+        pil = PILImage.fromarray(img)
+        pil = pil.resize((target_size[0], target_size[1]), PILImage.BILINEAR)
+        return np.array(pil, dtype=np.uint8)
+
     def _on_full_image(msg: Image):
         global _latest_full_image
         try:
             img = _decode_ros_image(msg)
-            from PIL import Image as PILImage
-            pil = PILImage.fromarray(img)
-            pil = pil.resize((resize[0], resize[1]), PILImage.BILINEAR)
+            result = _crop_and_resize(img, full_crop, resize)
             with _obs_lock:
-                _latest_full_image = np.array(pil, dtype=np.uint8)
+                _latest_full_image = result
         except Exception as e:
             log.warning("full_image callback error: %s", e)
 
@@ -216,11 +233,9 @@ def _ros_spin_loop():
         global _latest_wrist_image
         try:
             img = _decode_ros_image(msg)
-            from PIL import Image as PILImage
-            pil = PILImage.fromarray(img)
-            pil = pil.resize((resize[0], resize[1]), PILImage.BILINEAR)
+            result = _crop_and_resize(img, wrist_crop, resize)
             with _obs_lock:
-                _latest_wrist_image = np.array(pil, dtype=np.uint8)
+                _latest_wrist_image = result
         except Exception as e:
             log.warning("wrist_image callback error: %s", e)
 
