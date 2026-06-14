@@ -85,8 +85,10 @@ _endpoints: Optional[dict[str, str]] = None
 # ROS subscriber state (written by subscriber thread, read by handler)
 _latest_full_image: Optional[np.ndarray] = None
 _latest_wrist_image: Optional[np.ndarray] = None
-_latest_joint_states: Optional[np.ndarray] = None       # joint angles (proprio for VLA)
 _obs_lock = threading.Lock()
+
+# Piper SDK instance for direct joint reading (initialized in on_activate)
+_piper_inst = None
 
 # Safety filter state — last commanded joint vector in DATASET (SDK) units
 _last_action_sdk: Optional[np.ndarray] = None
@@ -243,64 +245,8 @@ def _ros_spin_loop():
         except Exception as e:
             log.warning("wrist_image callback error: %s", e)
 
-    # ── Joint state reading via piper_sdk (direct CAN, bypasses ROS topic) ──
-    # This is more reliable than subscribing to /arm/joint_states_single which
-    # can have QoS issues or stale data.
-    _piper_inst = None
-    can_port = _cfg.get("can_port", "can_piper")
-    try:
-        from piper_sdk import C_PiperInterface_V2
-        _piper_inst = C_PiperInterface_V2(can_port)
-        _piper_inst.ConnectPort()
-        log.info("[ROS-THREAD] piper_sdk connected on %s — reading joints directly", can_port)
-    except Exception as e:
-        log.warning("[ROS-THREAD] piper_sdk unavailable (%s) — falling back to ROS topic for joints", e)
-
-    def _read_joints_from_sdk():
-        """Read joint states directly from piper SDK (SDK raw units)."""
-        global _latest_joint_states
-        if _piper_inst is None:
-            return
-        try:
-            js = _piper_inst.GetArmJointMsgs().joint_state
-            gripper = _piper_inst.GetArmGripperMsgs().gripper_state.grippers_angle
-            sdk = np.array([
-                float(js.joint_1),
-                float(js.joint_2),
-                float(js.joint_3),
-                float(js.joint_4),
-                float(js.joint_5),
-                float(js.joint_6),
-                float(gripper),
-            ], dtype=np.float32)
-            _cb_counts["joints"] += 1
-            with _obs_lock:
-                _latest_joint_states = sdk
-        except Exception as e:
-            log.debug("piper_sdk joint read error: %s", e)
-
-    def _on_joint_states(msg: JointState):
-        """Fallback: latch joint angles from ROS topic (only used if piper_sdk unavailable)."""
-        global _latest_joint_states
-        if _piper_inst is not None:
-            return  # Skip ROS topic when SDK is active
-        _cb_counts["joints"] += 1
-        dim = int(_cfg.get("joint_state_dim", 7))
-        positions = list(msg.position)
-        if len(positions) < dim:
-            return
-        sdk = np.zeros(dim, dtype=np.float32)
-        n_joints = min(6, dim)
-        for i in range(n_joints):
-            sdk[i] = float(positions[i]) * SDK_PER_RAD
-        if dim >= 7 and len(positions) >= 7:
-            sdk[6] = float(positions[6]) * SDK_PER_M_GRIPPER
-        with _obs_lock:
-            _latest_joint_states = sdk
-
     node.create_subscription(Image, full_topic, _on_full_image, qos_best_effort)
     node.create_subscription(Image, wrist_topic, _on_wrist_image, qos_best_effort)
-    node.create_subscription(JointState, js_topic, _on_joint_states, qos_best_effort)
 
     # Publisher: joint-space command to piper_ctl
     _joint_cmd_pub = node.create_publisher(JointState, joint_cmd_topic, 10)
@@ -309,18 +255,17 @@ def _ros_spin_loop():
     _g_joint_cmd_pub = _joint_cmd_pub
     _g_node = node
 
-    log.info("subscribed: full=%s wrist=%s joints=%s | publish: %s",
-             full_topic, wrist_topic, js_topic, joint_cmd_topic)
-    log.info("[ROS-THREAD] entering spin loop...")
+    log.info("subscribed: full=%s wrist=%s | publish: %s",
+             full_topic, wrist_topic, joint_cmd_topic)
+    log.info("[ROS-THREAD] entering spin loop (joints read synchronously via SDK)...")
 
     while not _ros_stop_event.is_set():
         try:
             rclpy.spin_once(node, timeout_sec=0.05)
-            _read_joints_from_sdk()
             _cb_counts["spin"] += 1
             if _cb_counts["spin"] % 200 == 0:
-                log.info("[ROS-THREAD] spin=%d | callbacks received: full_img=%d wrist_img=%d joints=%d",
-                         _cb_counts["spin"], _cb_counts["full"], _cb_counts["wrist"], _cb_counts["joints"])
+                log.info("[ROS-THREAD] spin=%d | img callbacks: full=%d wrist=%d",
+                         _cb_counts["spin"], _cb_counts["full"], _cb_counts["wrist"])
         except Exception as e:
             log.warning("rclpy.spin_once raised: %s", e)
 
@@ -341,12 +286,36 @@ _g_node = None
 
 # ── observation + action helpers ────────────────────────────────────────────
 
+def _read_joint_states_sdk() -> Optional[np.ndarray]:
+    """Synchronously read joint states from piper SDK. Returns 7-dim SDK raw array or None."""
+    if _piper_inst is None:
+        return None
+    try:
+        js = _piper_inst.GetArmJointMsgs().joint_state
+        gripper = _piper_inst.GetArmGripperMsgs().gripper_state.grippers_angle
+        return np.array([
+            float(js.joint_1),
+            float(js.joint_2),
+            float(js.joint_3),
+            float(js.joint_4),
+            float(js.joint_5),
+            float(js.joint_6),
+            float(gripper),
+        ], dtype=np.float32)
+    except Exception as e:
+        log.warning("piper_sdk read failed: %s", e)
+        return None
+
+
 def _get_current_observation():
-    """Get latest (full_image, wrist_image, joint_states) or (None, None, None)."""
+    """Get latest (full_image, wrist_image, joint_states).
+    Images from ROS callbacks, joints from piper SDK directly."""
     with _obs_lock:
-        return (_latest_full_image.copy() if _latest_full_image is not None else None,
-                _latest_wrist_image.copy() if _latest_wrist_image is not None else None,
-                _latest_joint_states.copy() if _latest_joint_states is not None else None)
+        full_img = _latest_full_image.copy() if _latest_full_image is not None else None
+        wrist_img = _latest_wrist_image.copy() if _latest_wrist_image is not None else None
+    # Read joints synchronously from SDK — always fresh
+    state = _read_joint_states_sdk()
+    return (full_img, wrist_img, state)
 
 
 def _call_vla_server(instruction: str, full_image: np.ndarray,
@@ -684,8 +653,8 @@ def init(cfg):
 
 @vla_skill.on_activate
 def activate():
-    """CMD_ACTIVATE: heavy. Resolve vla_server endpoint, start ROS subscriber."""
-    global _endpoints
+    """CMD_ACTIVATE: heavy. Resolve vla_server endpoint, start ROS subscriber, init piper SDK."""
+    global _endpoints, _piper_inst
     with _state_lock:
         if _endpoints is not None:
             log.info("CMD_ACTIVATE — already active, no-op")
@@ -694,8 +663,21 @@ def activate():
             _endpoints = _resolve_inputs()
         except RuntimeError as e:
             return Err(str(e))
+
+        # Initialize piper SDK for direct joint reading
+        can_port = _cfg.get("can_port", "can_piper")
+        try:
+            from piper_sdk import C_PiperInterface_V2
+            _piper_inst = C_PiperInterface_V2(can_port)
+            _piper_inst.ConnectPort()
+            log.info("piper_sdk connected on '%s' — joint states will be read directly", can_port)
+        except Exception as e:
+            log.warning("piper_sdk unavailable (%s) — joint states will use ROS topic fallback", e)
+            _piper_inst = None
+
         _start_ros_subscriber_thread()
-    log.info("CMD_ACTIVATE ok — endpoints: %s", list(_endpoints.keys()))
+    log.info("CMD_ACTIVATE ok — endpoints: %s, piper_sdk: %s",
+             list(_endpoints.keys()), "connected" if _piper_inst else "unavailable")
     return Ok()
 
 
