@@ -557,8 +557,17 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
                 log.warning("DEBUG: failed to save debug images: %s", _e)
             # END TODO: DEBUG ONLY
 
-            # 2. Call VLA server (state is in SDK units, matching training)
-            actions = _call_vla_server(instruction, full_img, wrist_img, state)
+            # 2. Normalize state from SDK raw to [-1, 1] before sending to VLA server
+            a_min = np.array(_cfg["action_min"], dtype=np.float64)
+            a_max = np.array(_cfg["action_max"], dtype=np.float64)
+            state_normalized = np.clip(
+                2.0 * (state - a_min) / (a_max - a_min + 1e-8) - 1.0,
+                -1.0, 1.0
+            ).astype(np.float32)
+            log.info("STATE raw SDK: %s", np.array2string(state, precision=0, suppress_small=True))
+            log.info("STATE normalized: %s", np.array2string(state_normalized, precision=3, suppress_small=True))
+
+            actions = _call_vla_server(instruction, full_img, wrist_img, state_normalized)
             if actions is None:
                 return VlaExecute_Response(
                     success=False,
