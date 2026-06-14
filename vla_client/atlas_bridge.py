@@ -287,7 +287,8 @@ _g_node = None
 # ── observation + action helpers ────────────────────────────────────────────
 
 def _read_joint_states_sdk() -> Optional[np.ndarray]:
-    """Synchronously read joint states from piper SDK. Returns 7-dim SDK raw array or None."""
+    """Synchronously read joint states from piper SDK. Returns 7-dim SDK raw array or None.
+    Only reliable when CAN bus is not contested (i.e. at startup before actions are sent)."""
     if _piper_inst is None:
         return None
     try:
@@ -309,12 +310,20 @@ def _read_joint_states_sdk() -> Optional[np.ndarray]:
 
 def _get_current_observation():
     """Get latest (full_image, wrist_image, joint_states).
-    Images from ROS callbacks, joints from piper SDK directly."""
+    Images from ROS callbacks.
+    Joints: use _last_action_sdk (last sent target) if available,
+    otherwise read from SDK (only reliable at startup before CAN contention)."""
     with _obs_lock:
         full_img = _latest_full_image.copy() if _latest_full_image is not None else None
         wrist_img = _latest_wrist_image.copy() if _latest_wrist_image is not None else None
-    # Read joints synchronously from SDK — always fresh
-    state = _read_joint_states_sdk()
+
+    # After first action, use last sent target as state (arm should be at target)
+    if _last_action_sdk is not None:
+        state = _last_action_sdk.copy()
+    else:
+        # First call — read from SDK (CAN not yet contested by action sending)
+        state = _read_joint_states_sdk()
+
     return (full_img, wrist_img, state)
 
 
