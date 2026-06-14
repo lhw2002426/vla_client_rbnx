@@ -552,6 +552,13 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
                     elapsed_s=time.monotonic() - t0,
                 )
 
+            # Log VLA server response
+            log.info("VLA returned %d actions (executing %d), step_so_far=%d:",
+                     len(actions), min(chunk_execute, len(actions)), steps_executed)
+            for i, a in enumerate(actions):
+                marker = " >>>" if i < chunk_execute else "    "
+                log.info("%s  [%d] %s", marker, i, np.array2string(np.array(a), precision=2, suppress_small=True))
+
             # 3. Execute actions with safety filter (only first chunk_execute steps)
             for action in actions[:chunk_execute]:
                 if time.monotonic() >= deadline:
