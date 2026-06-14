@@ -269,7 +269,7 @@ def _ros_spin_loop():
 
     node.create_subscription(Image, full_topic, _on_full_image, qos_best_effort)
     node.create_subscription(Image, wrist_topic, _on_wrist_image, qos_best_effort)
-    node.create_subscription(JointState, js_topic, _on_joint_states, 10)
+    node.create_subscription(JointState, js_topic, _on_joint_states, qos_best_effort)
 
     # Publisher: joint-space command to piper_ctl
     _joint_cmd_pub = node.create_publisher(JointState, joint_cmd_topic, 10)
