@@ -514,14 +514,17 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
     max_steps = int(req.max_steps) if req.max_steps > 0 else 0
     action_hz = float(_cfg.get("action_hz", 10.0))
     action_interval = 1.0 / action_hz
+    # How many steps from each 10-step chunk to actually execute before re-inferring.
+    # Default 10 = execute full chunk. Set to 1 for maximum closed-loop precision.
+    chunk_execute = int(_cfg.get("action_steps_to_execute", 10))
 
     t0 = time.monotonic()
     deadline = t0 + timeout_s
     steps_executed = 0
     _last_action_sdk = None  # Reset safety filter state at start of new execution
 
-    log.info("execute(%r) timeout=%.1fs max_steps=%d hz=%.1f",
-             instruction, timeout_s, max_steps, action_hz)
+    log.info("execute(%r) timeout=%.1fs max_steps=%d hz=%.1f chunk_execute=%d",
+             instruction, timeout_s, max_steps, action_hz, chunk_execute)
 
     try:
         while time.monotonic() < deadline:
@@ -549,8 +552,8 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
                     elapsed_s=time.monotonic() - t0,
                 )
 
-            # 3. Execute actions with safety filter
-            for action in actions:
+            # 3. Execute actions with safety filter (only first chunk_execute steps)
+            for action in actions[:chunk_execute]:
                 if time.monotonic() >= deadline:
                     break
                 if max_steps > 0 and steps_executed >= max_steps:
