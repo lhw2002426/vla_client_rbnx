@@ -243,27 +243,58 @@ def _ros_spin_loop():
         except Exception as e:
             log.warning("wrist_image callback error: %s", e)
 
-    def _on_joint_states(msg: JointState):
-        """Latch current joint angles as proprioceptive input for VLA.
+    # ── Joint state reading via piper_sdk (direct CAN, bypasses ROS topic) ──
+    # This is more reliable than subscribing to /arm/joint_states_single which
+    # can have QoS issues or stale data.
+    _piper_inst = None
+    can_port = _cfg.get("can_port", "can_piper")
+    try:
+        from piper_sdk import C_PiperInterface_V2
+        _piper_inst = C_PiperInterface_V2(can_port)
+        _piper_inst.ConnectPort()
+        log.info("[ROS-THREAD] piper_sdk connected on %s — reading joints directly", can_port)
+    except Exception as e:
+        log.warning("[ROS-THREAD] piper_sdk unavailable (%s) — falling back to ROS topic for joints", e)
 
-        IMPORTANT: piper_ctl publishes joints in **radians** (and gripper in
-        **meters**). The VLA model was trained on **dataset SDK units**
-        (0.001° for joints, "2*µm" for gripper). We convert here so the
-        proprio handed to the server matches training distribution exactly.
-        """
+    def _read_joints_from_sdk():
+        """Read joint states directly from piper SDK (SDK raw units)."""
         global _latest_joint_states
+        if _piper_inst is None:
+            return
+        try:
+            js = _piper_inst.GetArmJointMsgs().joint_state
+            gripper = _piper_inst.GetArmGripperMsgs().gripper_state.grippers_angle
+            sdk = np.array([
+                float(js.joint_1),
+                float(js.joint_2),
+                float(js.joint_3),
+                float(js.joint_4),
+                float(js.joint_5),
+                float(js.joint_6),
+                float(gripper),
+            ], dtype=np.float32)
+            _cb_counts["joints"] += 1
+            with _obs_lock:
+                _latest_joint_states = sdk
+        except Exception as e:
+            log.debug("piper_sdk joint read error: %s", e)
+
+    def _on_joint_states(msg: JointState):
+        """Fallback: latch joint angles from ROS topic (only used if piper_sdk unavailable)."""
+        global _latest_joint_states
+        if _piper_inst is not None:
+            return  # Skip ROS topic when SDK is active
         _cb_counts["joints"] += 1
         dim = int(_cfg.get("joint_state_dim", 7))
         positions = list(msg.position)
         if len(positions) < dim:
             return
-        # Convert ROS units → dataset SDK units (matches builder's raw range)
         sdk = np.zeros(dim, dtype=np.float32)
         n_joints = min(6, dim)
         for i in range(n_joints):
-            sdk[i] = float(positions[i]) * SDK_PER_RAD          # rad → 0.001°
+            sdk[i] = float(positions[i]) * SDK_PER_RAD
         if dim >= 7 and len(positions) >= 7:
-            sdk[6] = float(positions[6]) * SDK_PER_M_GRIPPER    # m   → SDK gripper
+            sdk[6] = float(positions[6]) * SDK_PER_M_GRIPPER
         with _obs_lock:
             _latest_joint_states = sdk
 
@@ -284,9 +315,10 @@ def _ros_spin_loop():
 
     while not _ros_stop_event.is_set():
         try:
-            rclpy.spin_once(node, timeout_sec=0.1)
+            rclpy.spin_once(node, timeout_sec=0.05)
+            _read_joints_from_sdk()
             _cb_counts["spin"] += 1
-            if _cb_counts["spin"] % 100 == 0:
+            if _cb_counts["spin"] % 200 == 0:
                 log.info("[ROS-THREAD] spin=%d | callbacks received: full_img=%d wrist_img=%d joints=%d",
                          _cb_counts["spin"], _cb_counts["full"], _cb_counts["wrist"], _cb_counts["joints"])
         except Exception as e:
