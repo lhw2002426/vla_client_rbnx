@@ -542,6 +542,21 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
                 wrist_img = full_img.copy()
                 log.debug("wrist_image unavailable — using full_image as fallback")
 
+            # TODO: DEBUG ONLY — save images before sending to server.
+            # This produces many files. Comment out this block after debugging.
+            try:
+                from PIL import Image as PILImage
+                from pathlib import Path as _DebugPath
+                _debug_dir = _DebugPath(__file__).resolve().parent.parent / "debug_images"
+                _debug_dir.mkdir(parents=True, exist_ok=True)
+                _ts = int(time.time() * 1000)
+                PILImage.fromarray(full_img).save(_debug_dir / f"full_{_ts}_{steps_executed:04d}.jpg")
+                PILImage.fromarray(wrist_img).save(_debug_dir / f"wrist_{_ts}_{steps_executed:04d}.jpg")
+                log.info("DEBUG: saved images to %s (full_%d_%04d.jpg)", _debug_dir, _ts, steps_executed)
+            except Exception as _e:
+                log.warning("DEBUG: failed to save debug images: %s", _e)
+            # END TODO: DEBUG ONLY
+
             # 2. Call VLA server (state is in SDK units, matching training)
             actions = _call_vla_server(instruction, full_img, wrist_img, state)
             if actions is None:
