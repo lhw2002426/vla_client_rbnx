@@ -219,8 +219,11 @@ def _ros_spin_loop():
         pil = pil.resize((target_size[0], target_size[1]), PILImage.BILINEAR)
         return np.array(pil, dtype=np.uint8)
 
+    _cb_counts = {"full": 0, "wrist": 0, "joints": 0, "spin": 0}
+
     def _on_full_image(msg: Image):
         global _latest_full_image
+        _cb_counts["full"] += 1
         try:
             img = _decode_ros_image(msg)
             result = _crop_and_resize(img, full_crop, resize)
@@ -231,6 +234,7 @@ def _ros_spin_loop():
 
     def _on_wrist_image(msg: Image):
         global _latest_wrist_image
+        _cb_counts["wrist"] += 1
         try:
             img = _decode_ros_image(msg)
             result = _crop_and_resize(img, wrist_crop, resize)
@@ -248,6 +252,7 @@ def _ros_spin_loop():
         proprio handed to the server matches training distribution exactly.
         """
         global _latest_joint_states
+        _cb_counts["joints"] += 1
         dim = int(_cfg.get("joint_state_dim", 7))
         positions = list(msg.position)
         if len(positions) < dim:
@@ -280,6 +285,10 @@ def _ros_spin_loop():
     while not _ros_stop_event.is_set():
         try:
             rclpy.spin_once(node, timeout_sec=0.1)
+            _cb_counts["spin"] += 1
+            if _cb_counts["spin"] % 100 == 0:
+                log.info("[ROS-THREAD] spin=%d | callbacks received: full_img=%d wrist_img=%d joints=%d",
+                         _cb_counts["spin"], _cb_counts["full"], _cb_counts["wrist"], _cb_counts["joints"])
         except Exception as e:
             log.warning("rclpy.spin_once raised: %s", e)
 
