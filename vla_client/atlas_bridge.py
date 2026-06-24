@@ -12,11 +12,17 @@ Architecture:
     VLA Server ─[-1,1] actions─► vla_client de-norm + safety ─►
         sensor_msgs/JointState on /arm/joint_states ─► piper_ctl ─► CAN ─► arm
 
-Action space (matches piper_grasp_2cam dataset builder):
-    action[0:6] — joint1..joint6 absolute angles
-    action[6]   — gripper width
+Action space (matches piper_grasp_2cam_v3 dataset builder — BINARY gripper):
+    action[0:6] — joint1..joint6 absolute angles (continuous, SDK raw)
+    action[6]   — gripper open/close as BINARY {0, 1} in dataset space
+                  (-1 / +1 after normalization).
     All seven dims live in normalized [-1, 1] space and are de-normalized
     using ACTION_MIN / ACTION_MAX (the dataset's per-channel min/max).
+    The gripper dim is then expanded from the binary {0, 1} value back to
+    a continuous SDK opening (gripper_open_sdk / gripper_close_sdk) before
+    being sent to the arm. Conversely, the proprio gripper read from the
+    SDK is binarized at gripper_binarize_threshold_sdk before being fed
+    back into the model (so that the model only ever sees {0, 1}).
 
 Unit conventions (CRITICAL):
     Dataset / VLA training space — uses piper SDK raw units:
@@ -376,9 +382,9 @@ def _denormalize_action(action_norm: np.ndarray) -> np.ndarray:
     so:
         raw  = 0.5 * (norm + 1) * (ACTION_MAX - ACTION_MIN) + ACTION_MIN
 
-    Returns 7-vector in **dataset SDK units**:
-        [j1, j2, j3, j4, j5, j6]  in 0.001°
-        [j7]                       in "2 * µm" (piper SDK gripper)
+    Returns 7-vector in **dataset SDK units**, BUT note that for v3 the
+    gripper dim is in dataset binary space {0, 1} after this call — it must
+    be expanded to a continuous SDK opening via _expand_binary_gripper().
     """
     a_min = np.array(_cfg["action_min"], dtype=np.float64)
     a_max = np.array(_cfg["action_max"], dtype=np.float64)
@@ -391,6 +397,42 @@ def _denormalize_action(action_norm: np.ndarray) -> np.ndarray:
         a = out
     raw = 0.5 * (a + 1.0) * (a_max - a_min) + a_min
     return raw.astype(np.float32)
+
+
+def _binarize_state_gripper(state_sdk: np.ndarray) -> np.ndarray:
+    """v3 ONLY: turn a continuous gripper opening (read from piper SDK) into
+    a binary 0 / 1 *in dataset units*.
+
+    The model was trained on data where the gripper dim is strictly {0, 1},
+    so feeding it a continuous proprio value would shift the input
+    distribution and degrade dim-7 outputs. We binarize at
+    gripper_binarize_threshold_sdk (default 40000), which sits in the
+    "valley" between the closed (~0) and open (~84500) modes.
+
+    Indices 0..5 are passed through unchanged.
+    """
+    out = np.asarray(state_sdk, dtype=np.float32).copy()
+    threshold = float(_cfg.get("gripper_binarize_threshold_sdk", 40000.0))
+    out[6] = 1.0 if out[6] > threshold else 0.0
+    return out
+
+
+def _expand_binary_gripper(target_sdk: np.ndarray) -> np.ndarray:
+    """v3 ONLY: turn a *binary* gripper command (0 or 1, in dataset units)
+    back into a *continuous* SDK opening that the arm understands.
+
+    Called after _denormalize_action(). Indices 0..5 are passed through.
+
+    Mapping:
+        action[6] >  open_threshold  → gripper_open_sdk   (e.g. 84500 ≈ 42 mm)
+        action[6] <= open_threshold  → gripper_close_sdk  (e.g. 0)
+    """
+    out = np.asarray(target_sdk, dtype=np.float32).copy()
+    threshold = float(_cfg.get("gripper_open_threshold", 0.5))
+    open_sdk  = float(_cfg.get("gripper_open_sdk",  84500.0))
+    close_sdk = float(_cfg.get("gripper_close_sdk",     0.0))
+    out[6] = open_sdk if out[6] > threshold else close_sdk
+    return out
 
 
 def _apply_safety(target_sdk: np.ndarray) -> np.ndarray:
@@ -420,26 +462,40 @@ def _apply_safety(target_sdk: np.ndarray) -> np.ndarray:
 
 
 def _send_action_to_arm(action_norm: np.ndarray) -> None:
-    """De-normalize a [-1,1] VLA action and publish to /arm/joint_states."""
+    """De-normalize a [-1,1] VLA action and publish to /arm/joint_states.
+
+    v3 pipeline:
+        normalized [-1,1]
+          ─► _denormalize_action      → SDK units, gripper still {0, 1}
+          ─► _expand_binary_gripper   → SDK units, gripper continuous
+          ─► _apply_safety            → clip + rate limit (continuous)
+          ─► /arm/joint_states (rad / m)
+    """
     global _last_action_sdk
 
-    # 1) De-normalize → SDK units
+    # 1) De-normalize → SDK units (gripper dim still binary {0,1} for v3)
     target_sdk = _denormalize_action(action_norm)
 
-    # 2) Safety filter (clip + rate limit)
+    # 2) v3: expand binary gripper {0,1} → continuous SDK opening
+    target_sdk = _expand_binary_gripper(target_sdk)
+
+    # 3) Safety filter (clip + rate limit) — runs in continuous SDK space
     target_sdk = _apply_safety(target_sdk)
 
-    # 3) Convert SDK units → ROS units expected by piper_ctl.joint_callback
+    # 4) Convert SDK units → ROS units expected by piper_ctl.joint_callback
     #    joints[0..5] : 0.001°  → rad
     #    joint[6]     : "2*µm" → meters    (piper_ctl will * 1e6 * 2 again)
     target_ros = np.zeros(7, dtype=np.float64)
     target_ros[:6] = target_sdk[:6] / SDK_PER_RAD
     target_ros[6]  = float(target_sdk[6]) / SDK_PER_M_GRIPPER
 
-    # 4) Publish JointState
+    # 5) Publish JointState
     _publish_joint_state(target_ros)
 
-    # 5) Latch state for next-step rate limiting
+    # 6) Latch state for next-step rate limiting (continuous SDK).
+    #    NOTE: this is what _get_current_observation() returns as proprio next
+    #    iteration, so its gripper dim is continuous (~0 or ~84500). The
+    #    binarization back into model-input space happens in execute().
     _last_action_sdk = target_sdk
 
 
@@ -576,16 +632,19 @@ def execute(req: VlaExecute_Request) -> VlaExecute_Response:
                 log.warning("DEBUG: failed to save debug images: %s", _e)
             # END TODO: DEBUG ONLY
 
-            # 2. Normalize state from SDK raw to [-1, 1] before sending to VLA server
-            # Use state_min/state_max if provided, otherwise fall back to action_min/max
+            # 2. Pre-process state for VLA model:
+            #    a) v3: binarize gripper dim (model only ever saw {0, 1})
+            #    b) Normalize SDK raw → [-1, 1]
+            state_for_model = _binarize_state_gripper(state)
             s_min = np.array(_cfg.get("state_min", _cfg["action_min"]), dtype=np.float64)
             s_max = np.array(_cfg.get("state_max", _cfg["action_max"]), dtype=np.float64)
             state_normalized = np.clip(
-                2.0 * (state - s_min) / (s_max - s_min + 1e-8) - 1.0,
+                2.0 * (state_for_model - s_min) / (s_max - s_min + 1e-8) - 1.0,
                 -1.0, 1.0
             ).astype(np.float32)
-            log.info("STATE raw SDK: %s", np.array2string(state, precision=0, suppress_small=True))
-            log.info("STATE normalized: %s", np.array2string(state_normalized, precision=3, suppress_small=True))
+            log.info("STATE raw SDK     : %s", np.array2string(state, precision=0, suppress_small=True))
+            log.info("STATE binarized G : %s", np.array2string(state_for_model, precision=2, suppress_small=True))
+            log.info("STATE normalized  : %s", np.array2string(state_normalized, precision=3, suppress_small=True))
 
             actions = _call_vla_server(instruction, full_img, wrist_img, state_normalized)
             if actions is None:
@@ -652,6 +711,20 @@ def init(cfg):
         v = _cfg.get(key)
         if v is None or len(v) != 7:
             return Err(f"config.{key} must be a length-7 list (got {v!r})")
+
+    # state_min/max optional but if present must be length-7 (used for proprio
+    # normalization separately from action_min/max).
+    for key in ("state_min", "state_max"):
+        v = _cfg.get(key)
+        if v is not None and len(v) != 7:
+            return Err(f"config.{key} must be a length-7 list when set (got {v!r})")
+
+    # v3 binary-gripper params — warn (not fail) if missing so legacy v2
+    # configs without these keys still work via the safe defaults.
+    for key in ("gripper_binarize_threshold_sdk", "gripper_open_sdk",
+                "gripper_close_sdk", "gripper_open_threshold"):
+        if key not in _cfg:
+            log.warning("config.%s not set, using built-in default for v3 binary gripper", key)
 
     log.info("CMD_INIT ok (vla_server_url=%s, action_hz=%.1f, safety=%s)",
              _cfg.get("vla_server_url", "http://localhost:8777"),

@@ -52,12 +52,32 @@ config_defaults:
   timeout_s: 60.0
   joint_state_dim: 7
 
-  # ── Action de-normalization ────────────────────────────────────────────
-  # Must EXACTLY match piper_grasp_2cam_dataset_builder.ACTION_MIN / MAX.
-  # Order: [joint1, joint2, joint3, joint4, joint5, joint6, gripper], all
-  # in dataset SDK units (0.001° for joints, "2*µm" for gripper).
-  action_min: [66563.0,  -2921.0, -151557.0,  -53279.0, -37605.0,  -94743.0, -3000.0]
-  action_max: [132905.0, 194064.0,    712.0,  103398.0,  71141.0,  119408.0, 88500.0]
+  # ── Action de-normalization (piper_grasp2cam_v3, binary gripper) ──────
+  # Must EXACTLY match piper_grasp_2cam_v3_dataset_builder.ACTION_MIN / MAX
+  # AND piper_grasp_2cam_v3_dataset_builder.STATE_MIN / MAX.
+  # Order: [joint1..joint6, gripper] — joints in SDK 0.001°.
+  # IMPORTANT: gripper dim (idx 6) is BINARY {0, 1} in v3, NOT continuous.
+  #   - Dataset normalization: raw 0/1 → [-1,1] becomes -1/+1
+  #   - At runtime: binarize state[6] BEFORE normalize_state(),
+  #                 expand action[6] AFTER de-normalize (see gripper_* params below)
+  action_min: [-28042.0, 80978.0,    -98976.0, -772.51, 49456.09, -29964.0, 0.0]
+  action_max: [ 4566.0,  122947.0,   -63015.0,  3498.0, 68869.87,  14980.0, 1.0]
+  state_min:  [-28042.0, 80977.0,    -98974.0, -769.48, 49483.08, -29964.0, 0.0]
+  state_max:  [ 4566.0,  122944.96,  -63015.0,  3497.48, 68795.28, 14980.0, 1.0]
+
+  # ── Binary gripper ↔ continuous SDK opening (v3 specific) ─────────────
+  # Training data binarizes gripper at this threshold (SDK raw units).
+  # Used to:
+  #   1) binarize state[6] read from piper SDK BEFORE sending to model
+  #   2) decide open/close after model's binary output is de-normalized
+  gripper_binarize_threshold_sdk: 40000.0   # raw > 40000 → 1 (open)
+  # When model commands "open" (action[6] > 0.5 after de-norm), publish this
+  # continuous SDK opening to the arm. Tuned to dataset's typical "fully open"
+  # value (~84500 SDK raw ≈ 42 mm).
+  gripper_open_sdk:  84500.0
+  gripper_close_sdk: 0.0
+  # Threshold on de-normalized action[6] (which lives in [0, 1] for v3).
+  gripper_open_threshold: 0.5
 
   # ── Hardware joint limits (safety clip — applied AFTER de-normalization) ──
   # piper datasheet limits (mechanical hard stops) in SDK units (0.001°).
@@ -72,8 +92,11 @@ config_defaults:
 
   # ── Per-step rate limit (in dataset SDK units) ────────────────────────
   # 5000 SDK units = 5° per step  → at 10 Hz = 50°/s, comfortable for piper.
-  # Gripper: 20000 = 10 mm per step (full close→open in ~4 steps @ 10Hz).
-  max_delta_per_step_sdk: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 20000.0]
+  # Gripper: in v3 the gripper is binary, but the EXPANDED command (after
+  # _expand_binary_gripper) is in continuous SDK units (0 or ~84500), so
+  # we keep a generous gripper rate limit so a single open/close command
+  # is allowed to take effect within one step.
+  max_delta_per_step_sdk: [5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 100000.0]
 
   enable_safety_filter: true
 
